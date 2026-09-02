@@ -5,17 +5,25 @@ Cloudflare Turnstile token 获取模块
 某些 NewAPI 站点（如 seekai.cc）在 POST /api/user/checkin 上启用了
 middleware.TurnstileCheck()，必须携带 ?turnstile=<token> 才能签到。
 
-策略（按顺序尝试）：
-  1. 路由拦截：在目标站点同源下伪造一个极简页面，自己 explicit render 一个
-     Turnstile widget。好处是没有站点 SPA / CSP / 广告拦截干扰，且 token 的
-     hostname 仍然是目标站点（Turnstile sitekey 通常按域名白名单校验）。
-  2. 回退到真实登录页：等待站点自己加载 turnstile API，勾选协议触发渲染。
+关键实现细节
+------------
+Camoufox 默认把 page.evaluate 跑在**隔离世界**（isolated world），因此看不到
+页面主世界里的 window.turnstile / 自定义 window 变量。本模块因此：
 
-两种方式都用 playwright_captcha 的 ClickSolver 处理交互式（managed）widget。
+  * 启动时开启 main_world_eval=True，需要访问主世界时用 "mw:" 前缀 evaluate；
+  * 不用 wait_for_function（无法指定 world），改为自己轮询；
+  * token 优先从 DOM 隐藏域 input[name="cf-turnstile-response"] 读取
+    —— DOM 在两个 world 之间是共享的，这条路最稳。
+
+策略顺序：
+  1. 同源 stub 页面（page.route 伪造 {origin}/__hermes_turnstile__）+ explicit render。
+     没有 SPA / CSP / 广告拦截干扰，且 token 的 hostname 仍是目标站点。
+  2. 回退到真实登录页（勾选协议触发站点自身 widget）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from urllib.parse import urlparse
 
@@ -35,17 +43,18 @@ _STUB_PATH = "/__hermes_turnstile__"
 _STUB_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>ts</title></head>
 <body style="background:#fff;font-family:sans-serif">
-<div id="box"></div>
+<form id="f"><div id="box"></div></form>
 <script>
   window.__TS_TOKEN__ = null;
   window.__TS_ERROR__ = null;
   window.__TS_READY__ = false;
   window.onloadTurnstileCallback = function () {
     window.__TS_READY__ = true;
+    document.title = 'ts-ready';
     window.__TS_WIDGET__ = window.turnstile.render('#box', {
       sitekey: '__SITEKEY__',
-      callback: function (t) { window.__TS_TOKEN__ = t; },
-      'error-callback': function (e) { window.__TS_ERROR__ = String(e); }
+      callback: function (t) { window.__TS_TOKEN__ = t; document.title = 'ts-ok'; },
+      'error-callback': function (e) { window.__TS_ERROR__ = String(e); document.title = 'ts-err'; }
     });
   };
 </script>
@@ -53,7 +62,16 @@ _STUB_HTML = """<!doctype html>
 </body></html>
 """
 
-_READ_TOKEN_JS = """() => {
+# 只读 DOM —— 隔离世界也能访问
+_DOM_TOKEN_JS = """() => {
+    for (const el of document.querySelectorAll('input[name="cf-turnstile-response"]')) {
+        if (el.value) return el.value;
+    }
+    return null;
+}"""
+
+# 需要主世界（"mw:" 前缀）
+_MW_TOKEN_JS = """() => {
     if (window.__TS_TOKEN__) return window.__TS_TOKEN__;
     try {
         if (window.turnstile && window.turnstile.getResponse) {
@@ -65,11 +83,14 @@ _READ_TOKEN_JS = """() => {
             if (v2) return v2;
         }
     } catch (e) {}
-    for (const el of document.querySelectorAll('input[name="cf-turnstile-response"]')) {
-        if (el.value) return el.value;
-    }
     return null;
 }"""
+
+_DOM_STATE_JS = """() => ({
+    iframes: document.querySelectorAll('iframe[src*="turnstile"]').length,
+    inputs: document.querySelectorAll('input[name="cf-turnstile-response"]').length,
+    title: document.title,
+})"""
 
 
 def _cam_kwargs(proxy_config: dict | None) -> dict:
@@ -80,6 +101,7 @@ def _cam_kwargs(proxy_config: dict | None) -> dict:
         geoip=True if proxy_config else False,
         proxy=proxy_config,
         os="macos",
+        main_world_eval=True,  # 允许 "mw:" 前缀访问主世界
         config={"forceScopeAccess": True},
     )
     if _EXCLUDE_ADDONS:
@@ -87,11 +109,46 @@ def _cam_kwargs(proxy_config: dict | None) -> dict:
     return kw
 
 
+async def _mw(page, script: str):
+    """在主世界执行脚本，失败返回 None"""
+    try:
+        return await page.evaluate("mw:" + script)
+    except Exception:
+        return None
+
+
+async def _read_token(page) -> str | None:
+    """先 DOM 后主世界"""
+    try:
+        tok = await page.evaluate(_DOM_TOKEN_JS)
+    except Exception:
+        tok = None
+    if tok:
+        return tok
+    return await _mw(page, _MW_TOKEN_JS)
+
+
+async def _poll_token(page, account_name: str, timeout_ms: int) -> str | None:
+    """轮询等待 token（不用 wait_for_function，它无法指定 world）"""
+    waited = 0
+    step = 2000
+    while waited < timeout_ms:
+        tok = await _read_token(page)
+        if tok:
+            return tok
+        await page.wait_for_timeout(step)
+        waited += step
+    return None
+
+
 async def _harvest(page, solver, account_name: str, timeout_ms: int) -> str | None:
-    """widget 已在页面上后，处理交互并取回 token"""
-    token = await page.evaluate(_READ_TOKEN_JS)
-    if token:
-        return token
+    """widget 已挂上页面后：先直接读，再交给 solver 点击，最后轮询"""
+    tok = await _read_token(page)
+    if tok:
+        return tok
+
+    state = await page.evaluate(_DOM_STATE_JS)
+    print(f"ℹ️ {account_name}: dom state before solve -> {state}")
 
     try:
         await solver.solve_captcha(
@@ -101,11 +158,29 @@ async def _harvest(page, solver, account_name: str, timeout_ms: int) -> str | No
     except Exception as e:
         print(f"⚠️ {account_name}: ClickSolver did not complete ({e}), polling anyway")
 
-    try:
-        await page.wait_for_function("() => !!window.__TS_TOKEN__", timeout=timeout_ms)
-    except Exception:
-        pass
-    return await page.evaluate(_READ_TOKEN_JS)
+    tok = await _poll_token(page, account_name, timeout_ms)
+    if not tok:
+        state = await page.evaluate(_DOM_STATE_JS)
+        err = await _mw(page, "() => window.__TS_ERROR__")
+        print(f"⚠️ {account_name}: no token; dom={state} ts_error={err}")
+    return tok
+
+
+async def _wait_stub_ready(page, account_name: str, timeout_ms: int = 45000) -> bool:
+    """stub 页面：等 turnstile API onload 回调（通过 document.title 传信号，DOM 共享）"""
+    waited = 0
+    while waited < timeout_ms:
+        try:
+            state = await page.evaluate(_DOM_STATE_JS)
+        except Exception:
+            state = {}
+        if state.get("title") in ("ts-ready", "ts-ok") or state.get("iframes"):
+            return True
+        if state.get("title") == "ts-err":
+            return False
+        await page.wait_for_timeout(2000)
+        waited += 2000
+    return False
 
 
 async def _try_stub_page(browser, site_key: str, origin: str, account_name: str, timeout_ms: int):
@@ -123,13 +198,11 @@ async def _try_stub_page(browser, site_key: str, origin: str, account_name: str,
             framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
         ) as solver:
             await page.goto(stub_url, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_function("() => window.__TS_READY__ === true", timeout=45000)
-                print(f"ℹ️ {account_name}: Turnstile API loaded on stub page")
-            except Exception:
-                err = await page.evaluate("() => window.__TS_ERROR__")
-                print(f"⚠️ {account_name}: stub page API not ready (err={err})")
+            if not await _wait_stub_ready(page, account_name):
+                state = await page.evaluate(_DOM_STATE_JS)
+                print(f"⚠️ {account_name}: stub page widget not ready, dom={state}")
                 return None
+            print(f"ℹ️ {account_name}: stub page widget rendered")
             await page.wait_for_timeout(3000)
             return await _harvest(page, solver, account_name, timeout_ms)
     except Exception as e:
@@ -143,7 +216,7 @@ async def _try_stub_page(browser, site_key: str, origin: str, account_name: str,
 
 
 async def _try_login_page(browser, site_key: str, login_url: str, account_name: str, timeout_ms: int):
-    """策略 2：真实登录页，等站点自己加载 turnstile"""
+    """策略 2：真实登录页，勾协议触发站点自身 widget"""
     page = await browser.new_page()
     try:
         async with ClickSolver(
@@ -156,57 +229,52 @@ async def _try_login_page(browser, site_key: str, login_url: str, account_name: 
                 pass
             print(f"ℹ️ {account_name}: login page loaded, title={await page.title()!r}")
 
-            # Turnstile 常藏在“同意协议”之后
-            try:
-                for cb in await page.query_selector_all('input[type="checkbox"]'):
-                    try:
-                        if not await cb.is_checked():
-                            await cb.click(timeout=5000)
-                    except Exception:
-                        pass
-                await page.wait_for_timeout(3000)
-            except Exception:
-                pass
-
-            try:
-                await page.wait_for_function(
-                    "() => typeof window.turnstile !== 'undefined' && !!window.turnstile.render",
-                    timeout=30000,
-                )
-            except Exception:
-                frames = await page.evaluate(
-                    "() => document.querySelectorAll('iframe[src*=\"turnstile\"]').length"
-                )
-                print(
-                    f"⚠️ {account_name}: site turnstile API unavailable "
-                    f"(turnstile iframes={frames})"
-                )
-                return None
-
-            token = await page.evaluate(_READ_TOKEN_JS)
-            if not token:
+            # Turnstile 常藏在“同意用户协议”之后
+            for _ in range(3):
                 try:
-                    await page.evaluate(
-                        """(sitekey) => {
-                            window.__TS_TOKEN__ = null;
-                            let host = document.getElementById('__ts_host__');
-                            if (!host) {
-                                host = document.createElement('div');
-                                host.id = '__ts_host__';
-                                host.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;';
-                                document.body.appendChild(host);
-                            }
-                            window.__TS_WIDGET__ = window.turnstile.render(host, {
-                                sitekey: sitekey,
-                                callback: (t) => { window.__TS_TOKEN__ = t; },
-                                'error-callback': (e) => { window.__TS_ERROR__ = String(e); },
-                            });
-                        }""",
-                        site_key,
-                    )
-                    await page.wait_for_timeout(3000)
-                except Exception as e:
-                    print(f"⚠️ {account_name}: explicit render on login page failed: {e}")
+                    boxes = await page.query_selector_all('input[type="checkbox"]')
+                    for cb in boxes:
+                        try:
+                            if not await cb.is_checked():
+                                await cb.click(timeout=5000)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                await page.wait_for_timeout(3000)
+                state = await page.evaluate(_DOM_STATE_JS)
+                if state.get("iframes") or state.get("inputs"):
+                    print(f"ℹ️ {account_name}: site widget appeared, dom={state}")
+                    break
+            else:
+                state = await page.evaluate(_DOM_STATE_JS)
+                print(f"ℹ️ {account_name}: site widget not visible yet, dom={state}")
+
+            # 站点没渲染就自己 explicit render（主世界）
+            tok = await _read_token(page)
+            if not tok:
+                await _mw(
+                    page,
+                    """() => {
+                        if (!window.turnstile || !window.turnstile.render) return 'no-api';
+                        window.__TS_TOKEN__ = null;
+                        let host = document.getElementById('__ts_host__');
+                        if (!host) {
+                            host = document.createElement('div');
+                            host.id = '__ts_host__';
+                            host.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;';
+                            document.body.appendChild(host);
+                        }
+                        window.__TS_WIDGET__ = window.turnstile.render(host, {
+                            sitekey: '%s',
+                            callback: (t) => { window.__TS_TOKEN__ = t; },
+                            'error-callback': (e) => { window.__TS_ERROR__ = String(e); },
+                        });
+                        return 'rendered';
+                    }"""
+                    % site_key,
+                )
+                await page.wait_for_timeout(3000)
             return await _harvest(page, solver, account_name, timeout_ms)
     except Exception as e:
         print(f"⚠️ {account_name}: login page strategy failed: {e}")
@@ -250,12 +318,13 @@ async def get_turnstile_token(
         async with AsyncCamoufox(
             persistent_context=True, user_data_dir=tmp_dir, **_cam_kwargs(proxy_config)
         ) as browser:
-            for label, coro in (
-                ("stub-page", _try_stub_page(browser, site_key, origin, account_name, timeout_ms)),
-                ("login-page", _try_login_page(browser, site_key, login_url, account_name, timeout_ms)),
-            ):
+            strategies = (
+                ("stub-page", _try_stub_page, (browser, site_key, origin, account_name, timeout_ms)),
+                ("login-page", _try_login_page, (browser, site_key, login_url, account_name, timeout_ms)),
+            )
+            for label, fn, args in strategies:
                 try:
-                    token = await coro
+                    token = await fn(*args)
                 except Exception as e:
                     print(f"⚠️ {account_name}: strategy {label} raised: {e}")
                     token = None
