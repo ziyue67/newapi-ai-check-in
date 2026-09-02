@@ -5,26 +5,37 @@ Cloudflare Turnstile token 获取模块
 某些 NewAPI 站点（如 seekai.cc）在 POST /api/user/checkin 上启用了
 middleware.TurnstileCheck()，必须携带 ?turnstile=<token> 才能签到。
 
-关键实现细节
-------------
-Camoufox 默认把 page.evaluate 跑在**隔离世界**（isolated world），因此看不到
-页面主世界里的 window.turnstile / 自定义 window 变量。本模块因此：
+获取顺序
+--------
+1. 若配置了 TWOCAPTCHA_API_KEY，直接走 2Captcha 的 Turnstile 接口。
+   这条路不依赖本机浏览器环境，在 CI（数据中心 IP）上最可靠。
+2. 浏览器方案：同源 stub 页面（page.route 伪造 {origin}/__hermes_turnstile__），
+   页面内用原生 <script> + onload 回调 explicit render，token 从 DOM 隐藏域读取。
+3. 浏览器方案：真实登录页，勾选协议触发站点自身 widget。
 
-  * 启动时开启 main_world_eval=True，需要访问主世界时用 "mw:" 前缀 evaluate；
-  * 不用 wait_for_function（无法指定 world），改为自己轮询；
-  * token 优先从 DOM 隐藏域 input[name="cf-turnstile-response"] 读取
-    —— DOM 在两个 world 之间是共享的，这条路最稳。
+实现要点
+--------
+* 不用 main_world_eval / forceScopeAccess —— 这两个会改动 JS 环境，容易被
+  Turnstile 识别；stub 页面的 render 调用写在页面原生 <script> 里，本身就跑在
+  主世界，不需要跨 world evaluate。
+* token 统一从 DOM 隐藏域 input[name="cf-turnstile-response"] 读取（DOM 在
+  隔离世界与主世界之间共享），并用 document.title 传递 ready/err 信号。
+* 不用 page.wait_for_function（无法指定 world），改为自己轮询。
 
-策略顺序：
-  1. 同源 stub 页面（page.route 伪造 {origin}/__hermes_turnstile__）+ explicit render。
-     没有 SPA / CSP / 广告拦截干扰，且 token 的 hostname 仍是目标站点。
-  2. 回退到真实登录页（勾选协议触发站点自身 widget）。
+常见失败
+--------
+Turnstile 报 600010 且 iframe 数为 0 时，通常是 IP 信誉问题（数据中心 / CI IP）
+或浏览器指纹被判定不可信。此时应配置 PROXY（住宅代理）或 TWOCAPTCHA_API_KEY。
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
+import os
 import tempfile
+import time
+import urllib.parse
+import urllib.request
 from urllib.parse import urlparse
 
 from camoufox.async_api import AsyncCamoufox
@@ -45,17 +56,17 @@ _STUB_HTML = """<!doctype html>
 <body style="background:#fff;font-family:sans-serif">
 <form id="f"><div id="box"></div></form>
 <script>
-  window.__TS_TOKEN__ = null;
-  window.__TS_ERROR__ = null;
-  window.__TS_READY__ = false;
   window.onloadTurnstileCallback = function () {
-    window.__TS_READY__ = true;
     document.title = 'ts-ready';
-    window.__TS_WIDGET__ = window.turnstile.render('#box', {
-      sitekey: '__SITEKEY__',
-      callback: function (t) { window.__TS_TOKEN__ = t; document.title = 'ts-ok'; },
-      'error-callback': function (e) { window.__TS_ERROR__ = String(e); document.title = 'ts-err'; }
-    });
+    try {
+      window.turnstile.render('#box', {
+        sitekey: '__SITEKEY__',
+        callback: function () { document.title = 'ts-ok'; },
+        'error-callback': function (e) { document.title = 'ts-err:' + e; }
+      });
+    } catch (e) {
+      document.title = 'ts-throw:' + e;
+    }
   };
 </script>
 <script src="__API__?onload=onloadTurnstileCallback&render=explicit" async defer></script>
@@ -70,22 +81,6 @@ _DOM_TOKEN_JS = """() => {
     return null;
 }"""
 
-# 需要主世界（"mw:" 前缀）
-_MW_TOKEN_JS = """() => {
-    if (window.__TS_TOKEN__) return window.__TS_TOKEN__;
-    try {
-        if (window.turnstile && window.turnstile.getResponse) {
-            if (window.__TS_WIDGET__) {
-                const v = window.turnstile.getResponse(window.__TS_WIDGET__);
-                if (v) return v;
-            }
-            const v2 = window.turnstile.getResponse();
-            if (v2) return v2;
-        }
-    } catch (e) {}
-    return null;
-}"""
-
 _DOM_STATE_JS = """() => ({
     iframes: document.querySelectorAll('iframe[src*="turnstile"]').length,
     inputs: document.querySelectorAll('input[name="cf-turnstile-response"]').length,
@@ -93,6 +88,77 @@ _DOM_STATE_JS = """() => ({
 })"""
 
 
+# --------------------------------------------------------------------------- #
+# 2Captcha
+# --------------------------------------------------------------------------- #
+def _http_json(url: str, payload: dict | None = None, timeout: int = 30) -> dict:
+    if payload is None:
+        req = urllib.request.Request(url, headers={"User-Agent": "hermes"})
+    else:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "hermes"},
+            method="POST",
+        )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "ignore") or "{}")
+
+
+def solve_turnstile_via_2captcha(
+    page_url: str, site_key: str, api_key: str, account_name: str, timeout_s: int = 180
+) -> str | None:
+    """用 2Captcha 求解 Turnstile，返回 token"""
+    print(f"ℹ️ {account_name}: Solving Turnstile via 2Captcha")
+    try:
+        created = _http_json(
+            "https://api.2captcha.com/createTask",
+            {
+                "clientKey": api_key,
+                "task": {
+                    "type": "TurnstileTaskProxyless",
+                    "websiteURL": page_url,
+                    "websiteKey": site_key,
+                },
+            },
+        )
+    except Exception as e:
+        print(f"❌ {account_name}: 2Captcha createTask failed: {e}")
+        return None
+    if created.get("errorId"):
+        print(f"❌ {account_name}: 2Captcha error: {created.get('errorDescription')}")
+        return None
+    task_id = created.get("taskId")
+    print(f"ℹ️ {account_name}: 2Captcha taskId={task_id}, waiting…")
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(6)
+        try:
+            res = _http_json(
+                "https://api.2captcha.com/getTaskResult",
+                {"clientKey": api_key, "taskId": task_id},
+            )
+        except Exception as e:
+            print(f"⚠️ {account_name}: 2Captcha poll error: {e}")
+            continue
+        if res.get("errorId"):
+            print(f"❌ {account_name}: 2Captcha task error: {res.get('errorDescription')}")
+            return None
+        if res.get("status") == "ready":
+            tok = (res.get("solution") or {}).get("token")
+            if tok:
+                print(f"✅ {account_name}: 2Captcha returned token (len={len(tok)})")
+                return tok
+            print(f"❌ {account_name}: 2Captcha ready but no token: {res}")
+            return None
+    print(f"❌ {account_name}: 2Captcha timed out after {timeout_s}s")
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 浏览器方案
+# --------------------------------------------------------------------------- #
 def _cam_kwargs(proxy_config: dict | None) -> dict:
     kw = dict(
         headless=False,
@@ -100,38 +166,29 @@ def _cam_kwargs(proxy_config: dict | None) -> dict:
         locale="en-US",
         geoip=True if proxy_config else False,
         proxy=proxy_config,
-        os="macos",
-        main_world_eval=True,  # 允许 "mw:" 前缀访问主世界
-        config={"forceScopeAccess": True},
+        os="windows",
     )
     if _EXCLUDE_ADDONS:
         kw["exclude_addons"] = _EXCLUDE_ADDONS
     return kw
 
 
-async def _mw(page, script: str):
-    """在主世界执行脚本，失败返回 None"""
+async def _dom_state(page) -> dict:
     try:
-        return await page.evaluate("mw:" + script)
+        return await page.evaluate(_DOM_STATE_JS)
+    except Exception:
+        return {}
+
+
+async def _read_token(page) -> str | None:
+    try:
+        return await page.evaluate(_DOM_TOKEN_JS)
     except Exception:
         return None
 
 
-async def _read_token(page) -> str | None:
-    """先 DOM 后主世界"""
-    try:
-        tok = await page.evaluate(_DOM_TOKEN_JS)
-    except Exception:
-        tok = None
-    if tok:
-        return tok
-    return await _mw(page, _MW_TOKEN_JS)
-
-
-async def _poll_token(page, account_name: str, timeout_ms: int) -> str | None:
-    """轮询等待 token（不用 wait_for_function，它无法指定 world）"""
-    waited = 0
-    step = 2000
+async def _poll_token(page, timeout_ms: int) -> str | None:
+    waited, step = 0, 2000
     while waited < timeout_ms:
         tok = await _read_token(page)
         if tok:
@@ -142,14 +199,11 @@ async def _poll_token(page, account_name: str, timeout_ms: int) -> str | None:
 
 
 async def _harvest(page, solver, account_name: str, timeout_ms: int) -> str | None:
-    """widget 已挂上页面后：先直接读，再交给 solver 点击，最后轮询"""
     tok = await _read_token(page)
     if tok:
         return tok
 
-    state = await page.evaluate(_DOM_STATE_JS)
-    print(f"ℹ️ {account_name}: dom state before solve -> {state}")
-
+    print(f"ℹ️ {account_name}: dom before solve -> {await _dom_state(page)}")
     try:
         await solver.solve_captcha(
             captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
@@ -158,25 +212,21 @@ async def _harvest(page, solver, account_name: str, timeout_ms: int) -> str | No
     except Exception as e:
         print(f"⚠️ {account_name}: ClickSolver did not complete ({e}), polling anyway")
 
-    tok = await _poll_token(page, account_name, timeout_ms)
+    tok = await _poll_token(page, timeout_ms)
     if not tok:
-        state = await page.evaluate(_DOM_STATE_JS)
-        err = await _mw(page, "() => window.__TS_ERROR__")
-        print(f"⚠️ {account_name}: no token; dom={state} ts_error={err}")
+        print(f"⚠️ {account_name}: no token; dom={await _dom_state(page)}")
     return tok
 
 
 async def _wait_stub_ready(page, account_name: str, timeout_ms: int = 45000) -> bool:
-    """stub 页面：等 turnstile API onload 回调（通过 document.title 传信号，DOM 共享）"""
     waited = 0
     while waited < timeout_ms:
-        try:
-            state = await page.evaluate(_DOM_STATE_JS)
-        except Exception:
-            state = {}
-        if state.get("title") in ("ts-ready", "ts-ok") or state.get("iframes"):
+        st = await _dom_state(page)
+        title = str(st.get("title", ""))
+        if title in ("ts-ready", "ts-ok") or st.get("iframes") or st.get("inputs"):
             return True
-        if state.get("title") == "ts-err":
+        if title.startswith("ts-err") or title.startswith("ts-throw"):
+            print(f"⚠️ {account_name}: stub widget error -> {title}")
             return False
         await page.wait_for_timeout(2000)
         waited += 2000
@@ -184,7 +234,6 @@ async def _wait_stub_ready(page, account_name: str, timeout_ms: int = 45000) -> 
 
 
 async def _try_stub_page(browser, site_key: str, origin: str, account_name: str, timeout_ms: int):
-    """策略 1：同源伪造页面 + explicit render"""
     page = await browser.new_page()
     html = _STUB_HTML.replace("__SITEKEY__", site_key).replace("__API__", TURNSTILE_API)
     stub_url = f"{origin}{_STUB_PATH}"
@@ -195,14 +244,12 @@ async def _try_stub_page(browser, site_key: str, origin: str, account_name: str,
     try:
         await page.route(stub_url, handler)
         async with ClickSolver(
-            framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
+            framework=FrameworkType.CAMOUFOX, page=page, max_attempts=3, attempt_delay=3
         ) as solver:
             await page.goto(stub_url, wait_until="domcontentloaded")
             if not await _wait_stub_ready(page, account_name):
-                state = await page.evaluate(_DOM_STATE_JS)
-                print(f"⚠️ {account_name}: stub page widget not ready, dom={state}")
+                print(f"⚠️ {account_name}: stub widget not ready, dom={await _dom_state(page)}")
                 return None
-            print(f"ℹ️ {account_name}: stub page widget rendered")
             await page.wait_for_timeout(3000)
             return await _harvest(page, solver, account_name, timeout_ms)
     except Exception as e:
@@ -215,12 +262,11 @@ async def _try_stub_page(browser, site_key: str, origin: str, account_name: str,
             pass
 
 
-async def _try_login_page(browser, site_key: str, login_url: str, account_name: str, timeout_ms: int):
-    """策略 2：真实登录页，勾协议触发站点自身 widget"""
+async def _try_login_page(browser, login_url: str, account_name: str, timeout_ms: int):
     page = await browser.new_page()
     try:
         async with ClickSolver(
-            framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
+            framework=FrameworkType.CAMOUFOX, page=page, max_attempts=3, attempt_delay=3
         ) as solver:
             await page.goto(login_url, wait_until="domcontentloaded")
             try:
@@ -232,8 +278,7 @@ async def _try_login_page(browser, site_key: str, login_url: str, account_name: 
             # Turnstile 常藏在“同意用户协议”之后
             for _ in range(3):
                 try:
-                    boxes = await page.query_selector_all('input[type="checkbox"]')
-                    for cb in boxes:
+                    for cb in await page.query_selector_all('input[type="checkbox"]'):
                         try:
                             if not await cb.is_checked():
                                 await cb.click(timeout=5000)
@@ -242,39 +287,10 @@ async def _try_login_page(browser, site_key: str, login_url: str, account_name: 
                 except Exception:
                     pass
                 await page.wait_for_timeout(3000)
-                state = await page.evaluate(_DOM_STATE_JS)
-                if state.get("iframes") or state.get("inputs"):
-                    print(f"ℹ️ {account_name}: site widget appeared, dom={state}")
+                st = await _dom_state(page)
+                if st.get("iframes") or st.get("inputs"):
+                    print(f"ℹ️ {account_name}: site widget appeared, dom={st}")
                     break
-            else:
-                state = await page.evaluate(_DOM_STATE_JS)
-                print(f"ℹ️ {account_name}: site widget not visible yet, dom={state}")
-
-            # 站点没渲染就自己 explicit render（主世界）
-            tok = await _read_token(page)
-            if not tok:
-                await _mw(
-                    page,
-                    """() => {
-                        if (!window.turnstile || !window.turnstile.render) return 'no-api';
-                        window.__TS_TOKEN__ = null;
-                        let host = document.getElementById('__ts_host__');
-                        if (!host) {
-                            host = document.createElement('div');
-                            host.id = '__ts_host__';
-                            host.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;';
-                            document.body.appendChild(host);
-                        }
-                        window.__TS_WIDGET__ = window.turnstile.render(host, {
-                            sitekey: '%s',
-                            callback: (t) => { window.__TS_TOKEN__ = t; },
-                            'error-callback': (e) => { window.__TS_ERROR__ = String(e); },
-                        });
-                        return 'rendered';
-                    }"""
-                    % site_key,
-                )
-                await page.wait_for_timeout(3000)
             return await _harvest(page, solver, account_name, timeout_ms)
     except Exception as e:
         print(f"⚠️ {account_name}: login page strategy failed: {e}")
@@ -300,27 +316,35 @@ async def get_turnstile_token(
         site_key: Turnstile site key（可从 /api/status 的 turnstile_site_key 获取）
         account_name: 账号名，仅用于日志
         proxy_config: 代理配置 {"server": ..., "username": ..., "password": ...}
-        timeout_ms: 等待 token 的最长时间
+        timeout_ms: 浏览器方案等待 token 的最长时间
 
     Returns:
         token 字符串，失败返回 None
     """
     parsed = urlparse(login_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    safe_name = "".join(c if c.isalnum() else "_" for c in account_name)
+
+    # 1) 2Captcha（若配置）——不依赖本机浏览器环境
+    api_key = (os.getenv("TWOCAPTCHA_API_KEY") or "").strip()
+    if api_key:
+        tok = solve_turnstile_via_2captcha(login_url, site_key, api_key, account_name)
+        if tok:
+            return tok
+        print(f"⚠️ {account_name}: 2Captcha failed, falling back to browser")
 
     print(
         f"ℹ️ {account_name}: Starting browser to get Turnstile token for {origin} "
         f"(sitekey={site_key[:12]}…, proxy: {'true' if proxy_config else 'false'})"
     )
 
+    safe_name = "".join(c if c.isalnum() else "_" for c in account_name)
     with tempfile.TemporaryDirectory(prefix=f"camoufox_{safe_name}_turnstile_") as tmp_dir:
         async with AsyncCamoufox(
             persistent_context=True, user_data_dir=tmp_dir, **_cam_kwargs(proxy_config)
         ) as browser:
             strategies = (
                 ("stub-page", _try_stub_page, (browser, site_key, origin, account_name, timeout_ms)),
-                ("login-page", _try_login_page, (browser, site_key, login_url, account_name, timeout_ms)),
+                ("login-page", _try_login_page, (browser, login_url, account_name, timeout_ms)),
             )
             for label, fn, args in strategies:
                 try:
@@ -333,5 +357,9 @@ async def get_turnstile_token(
                     return token
                 print(f"ℹ️ {account_name}: strategy {label} produced no token")
 
-    print(f"❌ {account_name}: Failed to get Turnstile token (all strategies exhausted)")
+    print(
+        f"❌ {account_name}: Failed to get Turnstile token. "
+        f"若日志中出现 600010 且 turnstile iframe 数为 0，通常是 IP 信誉问题："
+        f"请配置 PROXY（住宅代理）或 TWOCAPTCHA_API_KEY。"
+    )
     return None
