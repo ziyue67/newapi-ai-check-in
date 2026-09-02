@@ -9,13 +9,14 @@ import inspect
 import hashlib
 import os
 import tempfile
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, quote
 
 from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
 from utils.config import AccountConfig, ProviderConfig
 from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
+from utils.get_turnstile_token import get_turnstile_token
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
 from utils.get_headers import get_browser_headers, get_curl_cffi_impersonate, print_browser_headers
@@ -54,6 +55,9 @@ class CheckIn:
 
         # storage-states 目录
         self.storage_state_dir = storage_state_dir
+
+        # 站点启用 Turnstile 校验时，运行期缓存拿到的 token
+        self.turnstile_token: str | None = None
 
         os.makedirs(self.storage_state_dir, exist_ok=True)
 
@@ -511,11 +515,29 @@ class CheckIn:
             headers: 请求头
         """
         try:
-            response = session.get(
-                self.provider_config.get_auth_state_url(),
-                headers=headers,
-                timeout=30,
-            )
+            if getattr(self.provider_config, "auth_state_method", "GET").upper() == "POST":
+                # 新版 new-api: POST /api/oauth/state  {"provider": "...", "intent": "login"}
+                # 返回 data.flow_token 作为 OAuth state
+                provider_key = "github"
+                auth_path = self.provider_config.auth_state_path or ""
+                post_headers = dict(headers)
+                post_headers["Content-Type"] = "application/json"
+                response = session.post(
+                    self.provider_config.get_auth_state_url(),
+                    headers=post_headers,
+                    json={"provider": provider_key, "intent": "login"},
+                    timeout=30,
+                )
+                print(
+                    f"ℹ️ {self.account_name}: auth state via POST {self.provider_config.get_auth_state_url()} "
+                    f"-> {response.status_code}"
+                )
+            else:
+                response = session.get(
+                    self.provider_config.get_auth_state_url(),
+                    headers=headers,
+                    timeout=30,
+                )
 
             if response.status_code == 200:
                 json_data = response_resolve(response, "get_auth_state", self.account_name)
@@ -528,6 +550,13 @@ class CheckIn:
                 # 检查响应是否成功
                 if json_data.get("success"):
                     auth_data = json_data.get("data")
+                    # 新版 new-api 返回 {"data": {"flow_token": "...", "expires_at": ...}}
+                    if isinstance(auth_data, dict):
+                        auth_data = (
+                            auth_data.get("flow_token")
+                            or auth_data.get("state")
+                            or auth_data.get("token")
+                        )
 
                     # 将 curl_cffi Cookies 转换为 Camoufox 格式
                     result_cookies = []
@@ -745,6 +774,13 @@ class CheckIn:
         if not check_in_url:
             print(f"❌ {self.account_name}: No check-in URL configured")
             return {"success": False, "error": "No check-in URL configured"}
+
+        # 站点启用了 middleware.TurnstileCheck() 时必须带 ?turnstile=<token>
+        turnstile_token = getattr(self, "turnstile_token", None)
+        if turnstile_token:
+            sep = "&" if "?" in check_in_url else "?"
+            check_in_url = f"{check_in_url}{sep}turnstile={quote(turnstile_token, safe='')}"
+            print(f"ℹ️ {self.account_name}: Attaching Turnstile token to check-in request")
 
         response = session.post(check_in_url, headers=checkin_headers, timeout=30)
 
@@ -1869,6 +1905,24 @@ class CheckIn:
                 print(f"⚠️ {self.account_name}: Continuing with empty cookies")
         else:
             print(f"ℹ️ {self.account_name}: Bypass not required, using user cookies directly")
+
+        # 站点签到接口启用了 Turnstile 校验时，先用浏览器取一个 token
+        if self.provider_config.needs_turnstile():
+            site_key = self.provider_config.resolve_turnstile_site_key()
+            if not site_key:
+                print(f"⚠️ {self.account_name}: turnstile_check enabled but no site key resolved")
+            else:
+                try:
+                    self.turnstile_token = await get_turnstile_token(
+                        login_url=self.provider_config.get_login_url(),
+                        site_key=site_key,
+                        account_name=self.account_name,
+                        proxy_config=self.camoufox_proxy_config,
+                    )
+                except Exception as e:
+                    print(f"❌ {self.account_name}: Error occurred while getting Turnstile token: {e}")
+                if not self.turnstile_token:
+                    print(f"⚠️ {self.account_name}: Continuing without Turnstile token (check-in may fail)")
 
         # 生成公用请求头（只生成一次 User-Agent，整个签到流程保持一致）
         # 注意：Referer 和 Origin 不在这里设置，由各个签到方法根据实际请求动态设置

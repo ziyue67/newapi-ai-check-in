@@ -54,6 +54,13 @@ class ProviderConfig:
     linuxdo_auth_path: str = "/api/oauth/linuxdo"
     linuxdo_auth_redirect_path: str = "/oauth/**"  # OAuth 回调路径匹配模式，支持通配符
     aliyun_captcha: bool = False
+    # 站点 POST /api/user/checkin 是否启用 Cloudflare Turnstile 校验
+    # （new-api middleware.TurnstileCheck()，需要 ?turnstile=<token>）
+    turnstile_check: bool = False
+    # Turnstile site key，留空则运行时从 {origin}{status_path} 的 turnstile_site_key 读取
+    turnstile_site_key: str | None = None
+    # 新版 new-api 的 /api/oauth/state 需要 POST + JSON body，老版本是 GET
+    auth_state_method: Literal["GET", "POST"] = "GET"
     bypass_method: Literal["waf_cookies", "cf_clearance"] | None = None
     auto_add: bool = False
     isCustomize: bool = False  # 是否为自定义 provider（从环境变量加载）
@@ -90,6 +97,9 @@ class ProviderConfig:
             linuxdo_auth_path=data.get("linuxdo_auth_path", "/api/oauth/linuxdo"),
             linuxdo_auth_redirect_path=data.get("linuxdo_auth_redirect_path", "/oauth/**"),
             aliyun_captcha=data.get("aliyun_captcha", False),
+            turnstile_check=data.get("turnstile_check", False),
+            turnstile_site_key=data.get("turnstile_site_key"),
+            auth_state_method=data.get("auth_state_method", "GET"),
             bypass_method=data.get("bypass_method"),
             auto_add=data.get("auto_add", False),
             isCustomize=is_customize,
@@ -146,6 +156,34 @@ class ProviderConfig:
 
         # 否则拼接路径
         return f"{self.origin}{self.check_in_path}"
+
+    def needs_turnstile(self) -> bool:
+        """站点签到接口是否需要 Turnstile token"""
+        return bool(self.turnstile_check)
+
+    def resolve_turnstile_site_key(self, session=None, headers: dict | None = None) -> str | None:
+        """获取 Turnstile site key
+
+        优先使用配置中的 turnstile_site_key；否则从 {origin}{status_path} 拉取。
+        """
+        if self.turnstile_site_key:
+            return self.turnstile_site_key
+        try:
+            import json as _json
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"{self.origin}{self.status_path}",
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = _json.loads(resp.read().decode("utf-8", errors="ignore"))
+            site_key = (data.get("data") or {}).get("turnstile_site_key") or None
+            if site_key:
+                self.turnstile_site_key = site_key
+            return site_key
+        except Exception:
+            return None
 
     def get_check_in_status_func(self) -> CheckInStatusFunc | None:
         """获取签到状态查询函数
