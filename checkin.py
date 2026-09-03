@@ -801,10 +801,14 @@ class CheckIn:
             # 检查签到结果
             message = json_data.get("message", json_data.get("msg", ""))
 
+            # 注意：不同站点的「今日已签到」文案不一致（seekai 用「已经签到」，
+            # justwoker 用「今日已签到」），统一用「已签到」子串兜住；
+            # 重复签到是幂等成功，不能算失败，否则会误报到通知渠道。
             if (
                 json_data.get("ret") == 1
                 or json_data.get("code") == 0
                 or json_data.get("success")
+                or "已签到" in message
                 or "已经签到" in message
                 or "签到成功" in message
             ):

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 from typing import TYPE_CHECKING
 
 from curl_cffi import requests as curl_requests
@@ -25,6 +26,7 @@ def get_newapi_check_in_status(
     cookies: dict,
     headers: dict,
     path: str = "/api/user/checkin",
+    attempts: int = 3,
 ) -> bool:
     """
     查询标准 newapi 签到状态，自动拼接当前月份
@@ -35,9 +37,36 @@ def get_newapi_check_in_status(
         cookies: cookies 字典
         headers: 请求头字典
         path: 签到状态接口路径，默认为 "/api/user/checkin"
+        attempts: 网络层失败时的重试次数（这些站点常在 CF 后偶发 502/超时）
 
     Returns:
         bool: 今日是否已签到
+    """
+    for attempt in range(1, attempts + 1):
+        ok, result = _query_check_in_status_once(
+            provider_config, account_config, cookies, headers, path
+        )
+        if ok:
+            return result
+        if attempt < attempts:
+            account_name = account_config.get_display_name()
+            print(f"⚠️ {account_name}: Retrying check-in status ({attempt}/{attempts - 1})")
+            time.sleep(3 * attempt)
+    return False
+
+
+def _query_check_in_status_once(
+    provider_config: "ProviderConfig",
+    account_config: "AccountConfig",
+    cookies: dict,
+    headers: dict,
+    path: str = "/api/user/checkin",
+) -> tuple[bool, bool]:
+    """单次查询签到状态。
+
+    Returns:
+        (query_ok, checked_in_today) —— query_ok=False 表示这次请求本身失败，
+        调用方可以重试；不要把网络失败当成「今天没签到」以外的信号使用。
     """
     account_name = account_config.get_display_name()
     # 代理优先级: 账号配置 > 全局配置
@@ -67,7 +96,7 @@ def get_newapi_check_in_status(
                 json_data = response_resolve(response, "get_check_in_status", account_name)
                 if json_data is None:
                     print(f"❌ {account_name}: Invalid response format for check-in status")
-                    return False
+                    return False, False
 
                 if json_data.get("success"):
                     status_data = json_data.get("data", {})
@@ -86,19 +115,19 @@ def get_newapi_check_in_status(
                         f"Total quota: ${total_quota_display}"
                     )
 
-                    return checked_in_today
+                    return True, checked_in_today
                 else:
                     error_msg = json_data.get("message", "Unknown error")
                     print(f"❌ {account_name}: Failed to get check-in status: {error_msg}")
-                    return False
+                    return True, False
             else:
                 print(f"❌ {account_name}: Failed to get check-in status: HTTP {response.status_code}")
-                return False
+                return False, False
         finally:
             session.close()
     except Exception as e:
         print(f"❌ {account_name}: Error getting check-in status: {e}")
-        return False
+        return False, False
 
 
 def create_newapi_check_in_status(
